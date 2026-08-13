@@ -1,17 +1,25 @@
-# ollama run llama3.2:3b -> To run model
-
+import os
+import json
+import asyncio
+import httpx
 from fastapi import FastAPI, Request
-from ddgs import DDGS
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-import asyncio, httpx, json
+from ddgs import DDGS
+import redis.asyncio as redis
 
-OLLAMA_API_URL = "http://localhost:11434"
-MODEL_NAME = "llama3.2:3b"
-TIMEOUT = 60  # seconds
-MAX_RETRIES = 5  # Maximum number of search results to return
-RETRY_DELAY = 2  # seconds
+# ─── Config ──────────────────────────────────────────────────────────
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
+MODEL_NAME     = os.getenv("MODEL_NAME", "llama3.2:3b")
+REDIS_URL      = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+TIMEOUT        = int(os.getenv("TIMEOUT", "60"))
+MAX_SEARCH_RES = int(os.getenv("MAX_SEARCH_RESULTS", "3"))
+MAX_API_RETRY  = int(os.getenv("MAX_API_RETRIES", "5"))
+RETRY_DELAY    = int(os.getenv("RETRY_DELAY", "2"))
+MAX_HISTORY    = int(os.getenv("MAX_HISTORY", "20"))
+HISTORY_TTL    = int(os.getenv("HISTORY_TTL", "604800"))
 
+# ─── FastAPI ─────────────────────────────────────────────────────────
 app = FastAPI(title="Ollama Chat API Service")
 app.add_middleware(
     CORSMiddleware,
@@ -21,114 +29,162 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HISTORY: list[dict]=[]
+# ─── Redis ───────────────────────────────────────────────────────────
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-def perform_websearch(query: str, max_results: int= 3):
-    """Perform a live web search using DuckDuckGo and formats context for llama."""
+
+def perform_websearch(query: str, max_results: int = 3) -> str:
     try:
         results = DDGS().text(query, max_results=max_results)
-        print(f"\n[DEBUG] Web Search Triggered for: '{query}'")
-        print(f"[DEBUG] Found {len(results)} results from the web!\n")
+        print(f"\n[DEBUG] Web Search: '{query}' -> {len(results)} results\n")
         if not results:
             return ""
-        search_context = "\n ---LIVE WEB SEARCH CONTEXT---\n"
+        ctx = "\n---LIVE WEB SEARCH CONTEXT---\n"
         for idx, item in enumerate(results, start=1):
             title = item.get("title", "No Title")
-            body = item.get("body", "No Description")
-            url = item.get("href", "")
-            search_context += f"[{idx}] {title}\n Snippet {body}\n URL: {url}\n\n"
-        search_context += "---END OF SEARCH CONTEXT---\n"
-        return search_context
+            body  = item.get("body", "No Description")
+            url   = item.get("href", "")
+            ctx  += f"[{idx}] {title}\nSnippet: {body}\nURL: {url}\n\n"
+        ctx += "---END OF SEARCH CONTEXT---\n"
+        return ctx
     except Exception as e:
-        print(f"Error during web search: {e}")
+        print(f"[ERROR] Web search failed: {e}")
         return ""
 
+
 async def check_model_available(client: httpx.AsyncClient, model_name: str) -> bool:
-    """Checks if the requested model is pulled and available in Ollama."""
     try:
-        response = await client.get(f"{OLLAMA_API_URL}/api/tags", timeout= 10)
-        response.raise_for_status()
-        models = [m["name"] for m in response.json().get("models", [])]
+        r = await client.get(f"{OLLAMA_API_URL}/api/tags", timeout=10)
+        r.raise_for_status()
+        models = [m["name"] for m in r.json().get("models", [])]
         return any(model_name == m or m.startswith(model_name) for m in models)
     except httpx.RequestError as e:
-        print(f"Error checking model availability: {e}")
+        print(f"[ERROR] Model check failed: {e}")
         return False
 
+
+# ─── Redis helpers ───────────────────────────────────────────────────
+async def get_history(session_id: str) -> list[dict]:
+    key = f"chat:history:{session_id}"
+    raw = await redis_client.lrange(key, 0, -1)
+    return [json.loads(item) for item in raw]
+
+
+async def add_history(session_id: str, user_msg: str, assistant_msg: str):
+    key   = f"chat:history:{session_id}"
+    entry = json.dumps({"user": user_msg, "assistant": assistant_msg})
+    await redis_client.rpush(key, entry)
+    await redis_client.ltrim(key, -MAX_HISTORY, -1)
+    await redis_client.expire(key, HISTORY_TTL)
+
+
+async def clear_history(session_id: str):
+    await redis_client.delete(f"chat:history:{session_id}")
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
-    """Health check endpoint to verify connection to Ollama and GPU availability."""
+    try:
+        await redis_client.ping()
+        redis_ok = True
+    except Exception as e:
+        redis_ok = False
+        print(f"[ERROR] Redis ping failed: {e}")
+
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(f"{OLLAMA_API_URL}/api/tags", timeout=10)
-            response.raise_for_status()
+            r = await client.get(f"{OLLAMA_API_URL}/api/tags", timeout=10)
+            r.raise_for_status()
             loaded = await check_model_available(client, MODEL_NAME)
-            return JSONResponse({"ok" : True, "model": MODEL_NAME, "model_loaded": loaded})
+            return JSONResponse({
+                "ok": True,
+                "model": MODEL_NAME,
+                "model_loaded": loaded,
+                "redis_connected": redis_ok,
+            })
         except httpx.RequestError as e:
-            return JSONResponse({"ok": False, "model_loaded": False})
+            return JSONResponse({
+                "ok": False,
+                "model_loaded": False,
+                "redis_connected": redis_ok,
+                "error": str(e),
+            })
 
 
 @app.post("/reset")
-async def reset_history():
-    """Reset the conversation history."""
-    global HISTORY
-    HISTORY.clear()
-    return JSONResponse({"ok": True, "message": "Conversation history reset."})
+async def reset_history(request: Request):
+    body = await request.json()
+    session_id = body.get("session_id", "default")
+    await clear_history(session_id)
+    return JSONResponse({
+        "ok": True,
+        "message": "Conversation history reset.",
+        "session_id": session_id,
+    })
+
 
 @app.post("/chat")
 async def chat(request: Request):
-    """Main Sreaming endpoint with live web search and automated GPU offloading"""
-    body = await request.json()
-    user_message = (body.get("message") or "").strip()
-    web_search= body.get("web_search", False)
-    if not user_message:
-        return JSONResponse({"ok": False, "error": "Message is required."}, status_code=400)
+    body       = await request.json()
+    user_msg   = (body.get("message") or "").strip()
+    web_search = body.get("web_search", False)
+    session_id = body.get("session_id", "default")
 
-    #1. Fetch live web search context if web_search is enabled
-    search_context = ""
+    if not user_msg:
+        return JSONResponse(
+            {"ok": False, "error": "Message is required."},
+            status_code=400,
+        )
+
+    search_ctx = ""
     if web_search:
-        search_context = await asyncio.to_thread(perform_websearch, user_message, MAX_RETRIES)
+        search_ctx = await asyncio.to_thread(perform_websearch, user_msg, MAX_SEARCH_RES)
 
-    #2. Build conversation history
-    context_text=""
-    for entry in HISTORY:
-        context_text += f"User: {entry['user']}\n Assistant: {entry['assistant']}\n"
+    history = await get_history(session_id)
+    context_text = ""
+    for entry in history:
+        context_text += f"User: {entry['user']}\nAssistant: {entry['assistant']}\n"
 
-    #if search context is available, append it to the context_text
-    if search_context:
+    if search_ctx:
         full_prompt = (
-            f"System: You are an intelligent AI assistant with live internet access. "
-            f"Use the following real-time web search results to answer the user's question accurately.\n"
-            f"{search_context}\n"
-            f"{context_text}User: {user_message}\nAssistant:")
+            "System: You are an intelligent AI assistant with live internet access. "
+            "Use the following real-time web search results to answer accurately.\n"
+            f"{search_ctx}\n"
+            f"{context_text}User: {user_msg}\nAssistant:"
+        )
     else:
         full_prompt = (
-            f"System: You are an intelligent AI assistant. "
-            f"Use the following conversation history to answer the user's question accurately.\n"
-            f"{context_text}User: {user_message}\nAssistant:")
+            "System: You are an intelligent AI assistant. "
+            "Use the conversation history to answer accurately.\n"
+            f"{context_text}User: {user_msg}\nAssistant:"
+        )
 
     async def generate():
-        url = f"{OLLAMA_API_URL}/api/generate"
+        url     = f"{OLLAMA_API_URL}/api/generate"
         payload = {
             "model": MODEL_NAME,
             "prompt": full_prompt,
             "stream": True,
-            "keep_alive": "5m",  # 👈 CHANGED: Keeps model in RTX 3050 VRAM for 5 mins for INSTANT replies
+            "keep_alive": "5m",
             "options": {"num_predict": 512, "temperature": 0.7},
         }
         full_response = ""
-        for attempt in range(1, MAX_RETRIES + 1):
+
+        for attempt in range(1, MAX_API_RETRY + 1):
             try:
                 async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                    async with client.stream("POST", url, json = payload) as response:
-                        if response.status_code != 200:
-                            raw = await response.aread()
+                    async with client.stream("POST", url, json=payload) as resp:
+                        if resp.status_code != 200:
+                            raw = await resp.aread()
                             try:
                                 err = json.loads(raw).get("error", raw.decode())
                             except Exception:
                                 err = raw.decode(errors="ignore")
-                            yield f"data: [ERROR] Ollama API returned status {response.status_code}: {err}\n\n"
+                            yield f"[ERROR] Ollama returned {resp.status_code}: {err}"
                             return
-                        async for line in response.aiter_lines():
+
+                        async for line in resp.aiter_lines():
                             if not line:
                                 continue
                             chunk = json.loads(line)
@@ -136,20 +192,16 @@ async def chat(request: Request):
                             full_response += token
                             yield token
                             if chunk.get("done"):
-                                HISTORY.append(
-                                    {
-                                        "user": user_message,
-                                        "assistant": full_response
-                                    }
-                                )
-                                return 
+                                await add_history(session_id, user_msg, full_response)
+                                return
+
             except httpx.ConnectError:
-                if attempt < MAX_RETRIES:
+                if attempt < MAX_API_RETRY:
                     await asyncio.sleep(RETRY_DELAY * attempt)
                     continue
                 yield "[Error: Could not connect to Ollama. Make sure Ollama is running!]"
-                return 
-            except httpx.TimeoutException: 
+                return
+            except httpx.TimeoutException:
                 yield "[Error: Request timed out]"
                 return
             except Exception as err:
@@ -157,6 +209,3 @@ async def chat(request: Request):
                 return
 
     return StreamingResponse(generate(), media_type="text/plain")
-
-
-
