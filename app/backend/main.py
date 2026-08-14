@@ -310,10 +310,16 @@ async def chat(request: Request):
     # 4. Construct System Prompt
     sys_instruction = "System: You are an intelligent AI assistant."
     if use_rag:
-        sys_instruction += (
-            " Answer the user's question using ONLY the provided document excerpts below. "
-            "If the answer is not in the documents, state that clearly."
-        )
+        # 4. Construct System Prompt
+        sys_instruction = (
+            "System: You are a helpful assistant. "
+            "CRITICAL INSTRUCTION: The user has provided LIVE WEB SEARCH RESULTS below marked between ---LIVE WEB SEARCH CONTEXT--- and ---END---. "
+            "You MUST use ONLY those search results to answer. "
+            "DO NOT use your internal knowledge. "
+            "DO NOT mention your training data cutoff. "
+            "If the search results do not contain the answer, say 'The search results do not contain this information.' "
+            "Cite the source numbers [1], [2], [3] when you use information."
+            )
 
     full_prompt = (
         f"{sys_instruction}\n"
