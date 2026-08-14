@@ -3,17 +3,14 @@
 # ==========================================
 FROM python:3.11-slim as builder
 
-# Stop Python from writing .pyc files and buffer stdout for clean logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Create a virtual environment (this makes it easy to copy dependencies later)
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy and install requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -22,7 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ==========================================
 FROM python:3.11-slim
 
-# Copy the environment variables to this stage too
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
@@ -32,20 +28,18 @@ RUN addgroup --system appgroup && adduser --system --group appuser
 
 WORKDIR /app
 
-# MULTI-STAGE MAGIC: Copy ONLY the clean virtual environment from Stage 1
+# Copy virtual environment
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy your actual application code
+# Copy application code
 COPY . .
 
-# Change ownership of the files to our secure non-root user
-RUN chown -R appuser:appgroup /app
+# CREATE CHROMA DIRECTORY AND ASSIGN OWNERSHIP
+RUN mkdir -p /data/chroma_db && chown -R appuser:appgroup /data/chroma_db /app
 
-# Switch to the secure user
+# Switch to non-root user
 USER appuser
 
-# Expose the port
 EXPOSE 8000
 
-# Command to run the app
 CMD ["uvicorn", "app.backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
