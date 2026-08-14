@@ -114,7 +114,7 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
 def perform_websearch(query: str, max_results: int = 3) -> str:
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(keywords=query, max_results=max_results))
+            results = list(ddgs.text(query, max_results=max_results))
         
         print(f"\n[DEBUG] Web Search: '{query}' -> {len(results)} results\n")
         if not results:
